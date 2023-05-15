@@ -1,0 +1,7 @@
+FROM python:latest
+
+
+COPY ../proxy/httpProxy.py httpProxy.py
+WORKDIR .
+
+CMD ["python", "./httpProxy.py"]

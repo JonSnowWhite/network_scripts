@@ -1,0 +1,22 @@
+version: '3'
+services:
+  echo:
+    network_mode: "host"
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfiles/DockerfileEcho
+  
+  proxy:
+    network_mode: "host"
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfiles/DockerfileProxy
+
+  httpproxy:
+    network_mode: "host"
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfiles/DockerfileHttpProxy

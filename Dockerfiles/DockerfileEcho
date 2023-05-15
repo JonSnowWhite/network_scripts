@@ -1,0 +1,7 @@
+FROM python:latest
+
+
+COPY ../echo/echo.py echo.py
+WORKDIR .
+
+CMD ["python", "./echo.py"]

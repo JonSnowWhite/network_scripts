@@ -6,8 +6,12 @@ Currently, this repository contains
 
 - [x] echo: A simple TCP echo server
 - [x] proxy: A simple proxy server hardcoded for one domain
-- [ ] record frag proxy: A proxy server that fragments client hello's
-- 
+- [x] record frag proxy: A proxy server that fragments client hello's
+- [ ] socksv4 functionality in proxy
+- [ ] socksv5 functionality in proxy
+- [ ] tcp fragmentation in proxy
+- [ ] other circumvention techniques for http and tls in proxy
+- [ ] quic functionality?
 
 # Usage
 ## Prerequisites

@@ -21,6 +21,8 @@ TLS_1_0_HEADER = b'\x16\x03\x01'
 TLS_1_1_HEADER = b'\x16\x03\x02'
 TLS_1_2_HEADER = b'\x16\x03\x03'
 
+HTTP_200_RESPONSE = b'HTTP/1.1 200 OK\n\n'
+
 
 def is_valid_ipv4_address(ip_address: str) -> bool:
     """
@@ -39,8 +41,11 @@ class ProxyMode(Enum):
     """
     Modes the proxy can operate in
     """
-    HTTP_CONNECT = 1,
-    SNI = 2
+    ALL = 0,
+    HTTP = 1
+    HTTPS = 2,
+    SNI = 3
+
     # TODO: SOCKSv4 = 4
     # TODO: SOCKSv5 = 5
 
@@ -50,14 +55,16 @@ class ProxyMode(Enum):
 
 class ParserException(Exception):
     """For exceptions during the parsing process"""
+
     def __init__(self, *args, **kwargs):
         super().__init__(args, kwargs)
 
 
-class SocketWrapper:
+class WrappedSocket:
     """
     Wraps a socket with useful utility functions.
     """
+
     def __init__(self, timeout: int, _socket: socket.socket):
         self.timeout = timeout
         self.buffer = b''
@@ -90,8 +97,11 @@ class SocketWrapper:
         :param size: Size of the buffer to read into.
         :return: Bytes read from the socket
         """
-        _res = self.buffer + self.socket.recv(size-len(self.buffer), *args, **kwargs)
-        self.buffer = b''
+        if len(self.buffer) > 0:
+            _res = self.buffer
+            self.buffer = b''
+        else:
+            _res = self.socket.recv(size, *args, **kwargs)
         return _res
 
     def send(self, *args, **kwargs) -> int:
@@ -101,9 +111,20 @@ class SocketWrapper:
         """
         return self.socket.send(*args, **kwargs)
 
+    def close(self):
+        self.socket.close()
+
+    def inject(self, content: bytes):
+        """
+        Injects bytes to the front of the buffer. Can be used to write back read data.
+        :param content: the bytes to prepend
+        :return: None
+        """
+        self.buffer = content + self.buffer
+
     def read_tls_record(self) -> bytes:
         """
-        Reads the content of the next tls record from the wire. Throws exception if no record is received.
+        Reads the content of the next tls record from the wire with headers. Throws exception if no record is received.
         :return: The contents of the TLS record
         """
         # read record header
@@ -115,24 +136,31 @@ class SocketWrapper:
 
         # read record length
         record_length = int.from_bytes(data[3:5], byteorder='big')
-        return self.read(record_length)
+        return data + self.read(record_length)
 
-    def read_tls_message(self) -> bytes:
+    def read_tls_message(self, peek=False) -> bytes:
         """
         Reads the content of the next tls message from the socket.
+        :param: whether to peek the tls message.
         :return: The content of the TLS message
         """
         message = b''
+        buffer = b''
         # headers
         len_to_read = 4
         # prevent infinite sockets
         timestamp = time()
         # parse records until message complete
         while len(message) < len_to_read and int(time() - timestamp) < self.timeout:
-            message += self.read_tls_record()
+            record = self.read_tls_record()
+            buffer += record
+            message += record[5:]
             if len(message) >= 4:
                 # can parse message length
                 len_to_read = int.from_bytes(message[1:4], byteorder='big')
+        if peek:
+            # re-inject all read records
+            self.inject(buffer)
         return message
 
 
@@ -140,10 +168,12 @@ class Proxy:
     """
     Proxy server
     """
-    def __init__(self, timeout:int=120, port:int=4433, record_frag:bool=False, frag_size:int=20, dot:bool=False,
-                 dot_ip:str="8.8.4.4", proxy_mode:ProxyMode=ProxyMode.HTTP_CONNECT, forward_proxy_address:str=None,
-                 forward_proxy_port:int=None, forward_proxy_mode:ProxyMode=ProxyMode.SNI,
-                 forward_proxy_resolve_address:bool=False):
+
+    def __init__(self, timeout: int = 120, port: int = 4433, record_frag: bool = False, frag_size: int = 20,
+                 dot: bool = False,
+                 dot_ip: str = "8.8.4.4", proxy_mode: ProxyMode = ProxyMode.ALL, forward_proxy_address: str = None,
+                 forward_proxy_port: int = None, forward_proxy_mode: ProxyMode = ProxyMode.SNI,
+                 forward_proxy_resolve_address: bool = False):
         # timeout for socket reads and message reception
         self.timeout = timeout
         # own port
@@ -203,7 +233,7 @@ class Proxy:
                             return self.resolve_domain(str(item.target))
                 return None
 
-    def forward(self, from_socket: SocketWrapper, to_socket: SocketWrapper, record_frag=False):
+    def forward(self, from_socket: WrappedSocket, to_socket: WrappedSocket, record_frag=False):
         """
         Forwards data between two sockets with optional record fragmentation. Falls back to forwarding if no TLS records
         can be parsed from the connection anymore.
@@ -225,7 +255,8 @@ class Proxy:
                         continue
                     base_header = record_header[:3]
                     record_len = int.from_bytes(record_header[3:], byteorder='big')
-                    is_tls = base_header == TLS_1_0_HEADER or base_header == TLS_1_1_HEADER or base_header == TLS_1_2_HEADER
+                    is_tls = base_header == TLS_1_0_HEADER or base_header == TLS_1_1_HEADER \
+                             or base_header == TLS_1_2_HEADER
                     if not is_tls:
                         logging.debug(f"Not a TLS handshake record header: {record_header}")
                         # did not receive tls record
@@ -249,11 +280,32 @@ class Proxy:
                          f"broken.")
 
     @staticmethod
-    def read_http_connect(client_socket: SocketWrapper) -> (str, int):
+    def read_http_get(client_socket: WrappedSocket) -> str:
+        """
+        Reads the first line of a http get request to parse the domain from it.
+        :param client_socket: Socket to read from.
+        :return: host in the get request
+        """
+        found = False
+        data = b''
+        i = 12  # GET http://
+        # increasingly peek until we find the linebreak
+        while not found and i < 200:
+            data = client_socket.peek(i)
+            if data[i-1] == b'\n':
+                found = True
+            else:
+                i += 1
+        host = data[11:].split(b'/')[0].decode('ASCII')  # cut GET http:// and parse until first slash
+
+        return host
+
+    @staticmethod
+    def read_http_connect(client_socket: WrappedSocket) -> (str, int):
         """
         Reads the first line of a http connect request.
         :param client_socket: Socket to read from.
-        :return: The first line of the request.
+        :return: host and port from the http connect request.
         """
         # check if first message is a CONNECT method
         try:
@@ -264,16 +316,13 @@ class Proxy:
             # Extract the host and port from the URL
             host, port = url.split(':')
 
-            # answer with 200 OK
-            client_socket.send(b'HTTP/1.1 200 OK\n\n')
-
             return host, int(port)
         except Exception as e:
             # not a connect method
             raise ParserException(f"Could not read CONNECT method with exception {e}")
 
     @staticmethod
-    def read_sni(client_socket: SocketWrapper) -> str:
+    def read_sni(client_socket: WrappedSocket) -> str:
         """
         Attempts to read the host from the SNI extension. If the client does not send a SNI extension, None is returned.
         :param client_socket: Socket to read from
@@ -281,7 +330,7 @@ class Proxy:
         """
 
         try:
-            tls_message = client_socket.read_tls_message()
+            tls_message = client_socket.read_tls_message(peek=True)
         except ParserException as e:
             raise e
         except Exception as e:
@@ -319,8 +368,8 @@ class Proxy:
                 # sni
                 list_len = int.from_bytes(tls_message[p:p + 2], byteorder='big')
                 p += 2
-                while p < list_len:
-                    p += 2
+                _list_len = p + list_len
+                while p < _list_len:
                     name_type = int.from_bytes(tls_message[p:p + 1], byteorder='big')
                     p += 1
                     name_len = int.from_bytes(tls_message[p:p + 2], byteorder='big')
@@ -334,27 +383,59 @@ class Proxy:
                         return hostname.decode("ASCII")
         raise ParserException("No SNI present")
 
-    def handle(self, client_socket: SocketWrapper):
+    def get_destination_address(self, ssocket: WrappedSocket) -> (str, int, bool):
+        """
+        Reads a proxy destination address and returns the host and port of the destination.
+        :return: Host and port of the destination server.
+        """
+        proxy_mode = self.proxy_mode
+        # dynamically determine proxy mode
+        if proxy_mode == ProxyMode.ALL:
+            header = ssocket.peek(16)
+            if header.startswith(b'GET ') or header.startswith(b'POST '):
+                logging.info('HTTP Proxy Request')
+                proxy_mode = ProxyMode.HTTP
+            elif header.startswith(b'CONNECT'):
+                logging.info('HTTPS Proxy Request')
+                proxy_mode = ProxyMode.HTTPS
+            elif header.startswith(TLS_1_0_HEADER) or header.startswith(TLS_1_1_HEADER) \
+                    or header.startswith(TLS_1_2_HEADER):
+                logging.info('SNI Proxy Request')
+                proxy_mode = ProxyMode.SNI
+            else:
+                raise ParserException(f"Could not determine message type of message {header}")
+
+        if proxy_mode == ProxyMode.HTTP:
+            host, port, needs_proxy_message = self.read_http_get(ssocket), 80, False
+            # answer with 200 OK
+            # ssocket.send(HTTP_200_RESPONSE)
+            logging.debug(f"Read host {host} and port {port} from HTTP GET")
+        elif proxy_mode == ProxyMode.HTTPS:
+            host, port = self.read_http_connect(ssocket)
+            needs_proxy_message = True
+            # answer with 200 OK
+            ssocket.send(HTTP_200_RESPONSE)
+            logging.debug(f"Read host {host} and port {port} from HTTP connect")
+        elif proxy_mode == ProxyMode.SNI:
+            host, port, needs_proxy_message = self.read_sni(ssocket), 443, True
+            logging.debug(f"Read host {host} and port {port} from SNI")
+        else:
+            raise ParserException("Unknown proxy type")
+        return host, port, needs_proxy_message
+
+    def handle(self, client_socket: WrappedSocket):
         """
         Handles the connection to a single client.
         :param client_socket: The socket of the client connection.
         :return: None
         """
         logging.debug("handling request")
+        # determine destination address
         try:
-            if self.proxy_mode == ProxyMode.HTTP_CONNECT:
-                host, port = self.read_http_connect(client_socket)
-                logging.debug(f"Read host {host} and port {port} from HTTP connect")
-            elif self.proxy_mode == ProxyMode.SNI:
-                host, port = self.read_sni(client_socket), 443
-                logging.debug(f"Read host {host} and port {port} from SNI")
-            else:
-                logging.error("Unknown proxy type")
-                return
+            host, port, needs_proxy_message = self.get_destination_address(client_socket)
         except ParserException as e:
             logging.warning(f"Could not parse initial proxy message with {e}. Stopping!")
             return
-        # TODO: SOCKSv4 and SOCKSv5
 
         # resolve domain if forward host wants it, or we do not have a forward host
         if not is_valid_ipv4_address(host) and \
@@ -375,15 +456,20 @@ class Proxy:
         # open socket to server
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.connect((target_host, target_port))
-        server_socket = SocketWrapper(self.timeout, server_socket)
+        server_socket = WrappedSocket(self.timeout, server_socket)
         logging.debug(f"Connected to {target_host}:{target_port}")
 
         # send proxy messages if necessary
         # TODO: also support proxy authentication?
-        if self.forward_proxy_address is not None and self.forward_proxy_mode == ProxyMode.HTTP_CONNECT:
-            server_socket.send(f'HTTP/1.1 CONNECT {host}:{port} HTTP/1.1\nHost: {host}:{port}\n\n'
+        if self.forward_proxy_address is not None and self.forward_proxy_mode == ProxyMode.HTTPS \
+                and needs_proxy_message:
+            server_socket.send(f'CONNECT {host}:{port} HTTP/1.1\nHost: {host}:{port}\n\n'
                                .encode('ASCII'))
             logging.debug("Send HTTP CONNECT to forward proxy")
+            # receive HTTP 200 OK
+            answer = server_socket.recv(4096)
+            if not answer.startswith(HTTP_200_RESPONSE):
+                logging.debug("Forward proxy rejected the connection")
 
         # start proxying
         threading.Thread(target=self.forward, args=(client_socket, server_socket, self.record_frag)).start()
@@ -400,7 +486,7 @@ class Proxy:
         print(f"### Started {self.proxy_mode} proxy on {self.port} ###")
         while True:  # listen for incoming connections
             client_socket, address = self.server.accept()
-            client_socket = SocketWrapper(self.timeout, client_socket)
+            client_socket = WrappedSocket(self.timeout, client_socket)
             logging.debug(f"request from the ip {address[0]}")
             # spawn a new thread that run the function handle()
             threading.Thread(target=self.handle, args=(client_socket,)).start()
@@ -427,7 +513,7 @@ def initialize_parser():
                         help="Turns on debugging")
 
     parser.add_argument('--proxy_mode', type=ProxyMode,
-                        default=ProxyMode.HTTP_CONNECT,
+                        default=ProxyMode.ALL,
                         help='Which type of proxy to run')
 
     parser.add_argument('--timeout', type=int,
@@ -467,7 +553,7 @@ def initialize_parser():
                         help='Port the forward proxy server runs on')
 
     parser.add_argument('--forward_proxy_mode', type=ProxyMode,
-                        default=ProxyMode.HTTP_CONNECT,
+                        default=ProxyMode.HTTPS,
                         help='The proxy type of the forward proxy')
 
     parser.add_argument('--forward_proxy_resolve_address', type=bool,
@@ -493,12 +579,12 @@ def main():
 
     setting = args.setting
     if setting == 0:
-        proxy = Proxy(args.timeout, args.port, True, 20, False, args.dot_resolver,
-                      ProxyMode.HTTP_CONNECT, '127.0.0.1', 4434, ProxyMode.SNI,
+        proxy = Proxy(args.timeout, args.port, False, 20, False, args.dot_resolver,
+                      ProxyMode.ALL, '127.0.0.1', 4434, ProxyMode.SNI,
                       False)
     elif setting == 1:
-        proxy = Proxy(args.timeout, 4434, False, args.frags_size, False, args.dot_resolver,
-                      ProxyMode.SNI, None, None, ProxyMode.HTTP_CONNECT,
+        proxy = Proxy(args.timeout, 4434, False, args.frag_size, False, args.dot_resolver,
+                      ProxyMode.ALL, None, None, ProxyMode.HTTPS,
                       False)
     else:
         proxy = Proxy(args.timeout, args.port, args.record_frag, args.frag_size, args.dot, args.dot_resolver,

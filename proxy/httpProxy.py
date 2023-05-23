@@ -194,7 +194,7 @@ class Proxy:
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    def resolve_domain(self, domain: str) -> str | None:
+    def resolve_domain(self, domain: str) -> str:
         """
         Resolves the given domain to an ip address.
         :param domain: domain name to resolve
@@ -512,7 +512,8 @@ def initialize_parser():
                         action=argparse.BooleanOptionalAction,
                         help="Turns on debugging")
 
-    parser.add_argument('--proxy_mode', type=ProxyMode,
+    parser.add_argument('--proxy_mode', type=ProxyMode.__getitem__,
+                        choices=ProxyMode,
                         default=ProxyMode.ALL,
                         help='Which type of proxy to run')
 
@@ -552,7 +553,8 @@ def initialize_parser():
                         default=4433,
                         help='Port the forward proxy server runs on')
 
-    parser.add_argument('--forward_proxy_mode', type=ProxyMode,
+    parser.add_argument('--forward_proxy_mode', type=ProxyMode.__getitem__,
+                        choices=ProxyMode,
                         default=ProxyMode.HTTPS,
                         help='The proxy type of the forward proxy')
 
@@ -579,7 +581,7 @@ def main():
 
     setting = args.setting
     if setting == 0:
-        proxy = Proxy(args.timeout, args.port, False, 20, False, args.dot_resolver,
+        proxy = Proxy(args.timeout, args.port, True, 20, False, args.dot_resolver,
                       ProxyMode.ALL, '127.0.0.1', 4434, ProxyMode.SNI,
                       False)
     elif setting == 1:

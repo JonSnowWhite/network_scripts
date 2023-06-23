@@ -12,6 +12,7 @@ PORT_CLIENT = 4433
 PORT_SERVER = 443
 HOSTNAME = 'twitter.com'
 
+
 def forward(from_socket, to_socket):
     while True:
         try:
@@ -20,6 +21,7 @@ def forward(from_socket, to_socket):
             return
         to_socket.send(data)
 
+
 def handle(client_socket):
     # open socket to server
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -27,6 +29,7 @@ def handle(client_socket):
     server_socket.connect((HOSTNAME, PORT_SERVER))
     threading.Thread(target=forward, args=(client_socket, server_socket)).start()
     threading.Thread(target=forward, args=(server_socket, client_socket)).start()
+
 
 # opening server socket
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -39,4 +42,4 @@ while True:  # listen for incoming connections
     client_socket.settimeout(TIMEOUT)
     print("request from the ip", address[0])
     # spawn a new thread that run the function handle()
-    threading.Thread(target=handle, args=(client_socket, )).start()
+    threading.Thread(target=handle, args=(client_socket,)).start()

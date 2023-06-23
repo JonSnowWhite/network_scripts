@@ -1,0 +1,7 @@
+FROM python:latest
+
+
+COPY ../echo/discard.py discard.py
+WORKDIR .
+
+CMD ["python", "./discard.py"]

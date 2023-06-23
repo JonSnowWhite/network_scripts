@@ -14,9 +14,9 @@ services:
       context: .
       dockerfile: Dockerfiles/DockerfileProxy
 
-  httpproxy:
+  discard:
     network_mode: "host"
     restart: unless-stopped
     build:
       context: .
-      dockerfile: Dockerfiles/DockerfileHttpProxy
+      dockerfile: Dockerfiles/DockerfileDiscard
